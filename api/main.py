@@ -3,7 +3,10 @@ import time
 import uuid
 from multiprocessing import Pool
 
+import jax.numpy as jnp
+import numpy as np
 import requests
+from jax.experimental.compilation_cache import compilation_cache as cc
 from modal import (
     Dict,
     Image,
@@ -11,12 +14,7 @@ from modal import (
     Stub,
     method,
 )
-
-import jax.numpy as jnp
-import numpy as np
-from jax.experimental.compilation_cache import compilation_cache as cc
 from transformers.pipelines.audio_utils import ffmpeg_read
-
 from whisper_jax import FlaxWhisperPipline
 
 
@@ -29,9 +27,7 @@ api_image = Image.from_dockerhub(
         "RUN apt-get update",
         "RUN apt-get install -y python3 python3-pip python-is-python3",
     ],
-).pip_install(
-    "jax[cuda12_pip]", "https://github.com/sanchit-gandhi/whisper-jax", "requests"
-)
+).pip_install("jax[cuda12_pip]", "https://github.com/sanchit-gandhi/whisper-jax", "requests")
 
 stub = Stub(
     "speedy-whisper-api",
@@ -53,9 +49,7 @@ logger = logging.getLogger("speedy-whisper-api")
 logger.setLevel(logging.INFO)
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    "%(asctime)s;%(levelname)s;%(message)s", "%Y-%m-%d %H:%M:%S"
-)
+formatter = logging.Formatter("%(asctime)s;%(levelname)s;%(message)s", "%Y-%m-%d %H:%M:%S")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
@@ -65,9 +59,7 @@ def identity(batch):
 
 
 # Copied from https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/utils.py#L50
-def format_timestamp(
-    seconds: float, always_include_hours: bool = False, decimal_marker: str = "."
-):
+def format_timestamp(seconds: float, always_include_hours: bool = False, decimal_marker: str = "."):
     if seconds is not None:
         milliseconds = round(seconds * 1000.0)
 
@@ -92,9 +84,7 @@ class Whisper:
     # Code below executes on container start
     # https://modal.com/docs/guide/lifecycle-functions#__enter__-and-__aenter__
     def __enter__(self):
-        self.pipeline = FlaxWhisperPipline(
-            checkpoint, dtype=jnp.bfloat16, batch_size=BATCH_SIZE
-        )
+        self.pipeline = FlaxWhisperPipline(checkpoint, dtype=jnp.bfloat16, batch_size=BATCH_SIZE)
         self.pool = Pool(NUM_PROC)
 
         # Pre-compile Whisper-JAX code to container architecture. Subsequent function
@@ -102,16 +92,12 @@ class Whisper:
         logger.info("Compiling forward call...")
         start = time.time()
         random_inputs = {"input_features": np.ones((BATCH_SIZE, 80, 3000))}
-        self.pipeline.forward(
-            random_inputs, batch_size=BATCH_SIZE, return_timestamps=True
-        )
+        self.pipeline.forward(random_inputs, batch_size=BATCH_SIZE, return_timestamps=True)
         compile_time = time.time() - start
         logger.info(f"Compiled in {compile_time}s")
 
     def generate_transcription(self, inputs: dict, task: str, return_timestamps: bool):
-        dataloader = self.pipeline.preprocess_batch(
-            inputs, chunk_length_s=CHUNK_LENGTH_S, batch_size=BATCH_SIZE
-        )
+        dataloader = self.pipeline.preprocess_batch(inputs, chunk_length_s=CHUNK_LENGTH_S, batch_size=BATCH_SIZE)
         logger.info("pre-processing audio file...")
         dataloader = self.pool.map(identity, dataloader)
         logger.info("done post-processing")
@@ -122,17 +108,13 @@ class Whisper:
         # iterate over our chunked audio samples - always predict timestamps to reduce hallucinations
         for batch, _ in zip(dataloader):
             model_outputs.append(
-                self.pipeline.forward(
-                    batch, batch_size=BATCH_SIZE, task=task, return_timestamps=True
-                )
+                self.pipeline.forward(batch, batch_size=BATCH_SIZE, task=task, return_timestamps=True)
             )
         runtime = time.time() - start_time
         logger.info("done transcription")
 
         logger.info("post-processing...")
-        post_processed = self.pipeline.postprocess(
-            model_outputs, return_timestamps=True
-        )
+        post_processed = self.pipeline.postprocess(model_outputs, return_timestamps=True)
         text = post_processed["text"]
         if return_timestamps:
             timestamps = post_processed.get("chunks")
@@ -153,9 +135,7 @@ class Whisper:
         response = requests.get(audio_url)
         if response.status_code != 200:
             logger.warning("Failed to download audio file")
-            raise ValueError(
-                "Failed to download audio file from URL. Please check the URL and try again."
-            )
+            raise ValueError("Failed to download audio file from URL. Please check the URL and try again.")
         logger.info(f"{job_id}: Download complete.")
         file = response.content
 
@@ -175,8 +155,6 @@ class Whisper:
         }
         logger.info(f"{job_id}: Chunked audio file.")
         logger.info(f"{job_id}: Transcribing using Whisper-JAX...")
-        text, runtime = Whisper().generate_transcription(
-            inputs, task=task, return_timestamps=return_timestamps
-        )
+        text, runtime = Whisper().generate_transcription(inputs, task=task, return_timestamps=return_timestamps)
         logger.info(f"{job_id}: Transcription complete.")
         return text, runtime
