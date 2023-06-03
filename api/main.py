@@ -3,6 +3,7 @@ import time
 import uuid
 from multiprocessing import Pool
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import requests
@@ -12,7 +13,9 @@ from modal import (
     Image,
     SharedVolume,
     Stub,
+    gpu,
     method,
+    web_endpoint,
 )
 from transformers.pipelines.audio_utils import ffmpeg_read
 from whisper_jax import FlaxWhisperPipline
@@ -20,14 +23,23 @@ from whisper_jax import FlaxWhisperPipline
 
 volume = SharedVolume().persist("whisper-cache-volume")
 
-api_image = Image.from_dockerhub(
-    # CUDA and CUDNN required to install JAX
-    "nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04",
-    setup_dockerfile_commands=[
-        "RUN apt-get update",
-        "RUN apt-get install -y python3 python3-pip python-is-python3",
-    ],
-).pip_install("jax[cuda12_pip]", "https://github.com/sanchit-gandhi/whisper-jax", "requests")
+api_image = (
+    Image.from_dockerhub(
+        # CUDA and CUDNN required to install JAX
+        "nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04",
+        setup_dockerfile_commands=[
+            "RUN apt-get update -y && apt-get install -y git python3-pip",
+            "RUN ln -s /usr/bin/python3 /usr/bin/python",
+        ],
+    )
+    .pip_install("jax[cuda12_local]", "https://github.com/sanchit-gandhi/whisper-jax/archive/main.tar.gz", "requests")
+    .run_commands(
+        "echo hi i am modal",
+        "nvcc --version",
+        "pip install --upgrade jax jaxlib[cuda12] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
+        gpu=True,
+    )
+)
 
 stub = Stub(
     "speedy-whisper-api",
@@ -35,7 +47,6 @@ stub = Stub(
 )
 
 stub.running_jobs = Dict()
-## LOOK AT THIS SHIT - WHAT IS CC
 cc.initialize_cache("./jax_cache")  # TODO: Move to Modal SharedVolume
 checkpoint = "openai/whisper-large-v2"
 
@@ -79,22 +90,42 @@ def format_timestamp(seconds: float, always_include_hours: bool = False, decimal
         return seconds
 
 
-@stub.cls(cpu=4)
+@stub.function(cpu=4, gpu=gpu.A100(memory=20))
+@web_endpoint()
+def run_me():
+    print("I also update on file edit!")
+    with Whisper() as whisper:
+        result, runtime = whisper.transcribe(
+            "https://qualitativecloud.slack.com/files/U03MHNU00BZ/F05AQPAKY93/1_navy_federal_credit_union_us-billsimmons__midroll_.mp3",
+            "transcribe",
+            "false",
+        )
+        print(result, runtime)
+
+
+@stub.cls(cpu=4, gpu=gpu.T4(count=1))
 class Whisper:
     # Code below executes on container start
     # https://modal.com/docs/guide/lifecycle-functions#__enter__-and-__aenter__
     def __enter__(self):
+        print(jax.devices())
         self.pipeline = FlaxWhisperPipline(checkpoint, dtype=jnp.bfloat16, batch_size=BATCH_SIZE)
         self.pool = Pool(NUM_PROC)
 
         # Pre-compile Whisper-JAX code to container architecture. Subsequent function
         # calls will call this cached/compiled code which will be super-fast.
         logger.info("Compiling forward call...")
+        print("Compiling forward call...")
         start = time.time()
         random_inputs = {"input_features": np.ones((BATCH_SIZE, 80, 3000))}
         self.pipeline.forward(random_inputs, batch_size=BATCH_SIZE, return_timestamps=True)
         compile_time = time.time() - start
         logger.info(f"Compiled in {compile_time}s")
+        print(f"Compiled in {compile_time}s")
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.pool.terminate()
+        self.pool.join()
 
     def generate_transcription(self, inputs: dict, task: str, return_timestamps: bool):
         dataloader = self.pipeline.preprocess_batch(inputs, chunk_length_s=CHUNK_LENGTH_S, batch_size=BATCH_SIZE)
