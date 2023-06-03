@@ -1,20 +1,15 @@
 import logging
-import math
 import os
-import tempfile
 import time
 from multiprocessing import Pool
 
-import gradio as gr
 import jax.numpy as jnp
 import numpy as np
-import yt_dlp as youtube_dl
 from jax.experimental.compilation_cache import compilation_cache as cc
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.pipelines.audio_utils import ffmpeg_read
 
 from whisper_jax import FlaxWhisperPipline
-
 
 cc.initialize_cache("./jax_cache")  # TODO: Move to Modal SharedVolume
 checkpoint = "openai/whisper-large-v2"
@@ -24,17 +19,6 @@ CHUNK_LENGTH_S = 30
 NUM_PROC = 32
 FILE_LIMIT_MB = 1000
 YT_LENGTH_LIMIT_S = 7200  # limit to 2 hour YouTube files
-
-title = "Whisper JAX: The Fastest Whisper API ⚡️"
-
-description = """Whisper JAX is an optimised implementation of the [Whisper model](https://huggingface.co/openai/whisper-large-v2) by OpenAI. It runs on JAX with a TPU v4-8 in the backend. Compared to PyTorch on an A100 GPU, it is over [**70x faster**](https://github.com/sanchit-gandhi/whisper-jax#benchmarks), making it the fastest Whisper API available.
-
-Note that at peak times, you may find yourself in the queue for this demo. When you submit a request, your queue position will be shown in the top right-hand side of the demo pane. Once you reach the front of the queue, your audio file will be transcribed, with the progress displayed through a progress bar. 
-
-To skip the queue, you may wish to create your own inference endpoint, details for which can be found in the [Whisper JAX repository](https://github.com/sanchit-gandhi/whisper-jax#creating-an-endpoint).
-"""
-
-article = "Whisper large-v2 model by OpenAI. Backend running JAX on a TPU v4-8 through the generous support of the [TRC](https://sites.research.google/trc/about/) programme. Whisper JAX [code](https://github.com/sanchit-gandhi/whisper-jax) and Gradio demo by 🤗 Hugging Face."
 
 language_names = sorted(TO_LANGUAGE_CODE.keys())
 
@@ -98,21 +82,10 @@ if __name__ == "__main__":
     compile_time = time.time() - start
     logger.info(f"compiled in {compile_time}s")
 
-    def tqdm_generate(
-        inputs: dict, task: str, return_timestamps: bool, progress: gr.Progress
-    ):
-        inputs_len = inputs["array"].shape[0]
-        all_chunk_start_idx = np.arange(0, inputs_len, step)
-        num_samples = len(all_chunk_start_idx)
-        num_batches = math.ceil(num_samples / BATCH_SIZE)
-        dummy_batches = list(
-            range(num_batches)
-        )  # Gradio progress bar not compatible with generator, see https://github.com/gradio-app/gradio/issues/3841
-
+    def tqdm_generate(inputs: dict, task: str, return_timestamps: bool):
         dataloader = pipeline.preprocess_batch(
             inputs, chunk_length_s=CHUNK_LENGTH_S, batch_size=BATCH_SIZE
         )
-        progress(0, desc="Pre-processing audio file...")
         logger.info("pre-processing audio file...")
         dataloader = pool.map(identity, dataloader)
         logger.info("done post-processing")
@@ -121,9 +94,7 @@ if __name__ == "__main__":
         start_time = time.time()
         logger.info("transcribing...")
         # iterate over our chunked audio samples - always predict timestamps to reduce hallucinations
-        for batch, _ in zip(
-            dataloader, progress.tqdm(dummy_batches, desc="Transcribing...")
-        ):
+        for batch, _ in zip(dataloader):
             model_outputs.append(
                 pipeline.forward(
                     batch, batch_size=BATCH_SIZE, task=task, return_timestamps=True
@@ -145,20 +116,17 @@ if __name__ == "__main__":
         logger.info("done post-processing")
         return text, runtime
 
-    def transcribe_chunked_audio(
-        inputs, task, return_timestamps, progress=gr.Progress()
-    ):
-        progress(0, desc="Loading audio file...")
+    def transcribe_chunked_audio(inputs, task, return_timestamps):
         logger.info("loading audio file...")
         if inputs is None:
             logger.warning("No audio file")
-            raise gr.Error(
+            raise ValueError(
                 "No audio file submitted! Please upload an audio file before submitting your request."
             )
         file_size_mb = os.stat(inputs).st_size / (1024 * 1024)
         if file_size_mb > FILE_LIMIT_MB:
             logger.warning("Max file size exceeded")
-            raise gr.Error(
+            raise ValueError(
                 f"File size exceeds file size limit. Got file of size {file_size_mb:.2f}MB for a limit of {FILE_LIMIT_MB}MB."
             )
 
@@ -172,148 +140,6 @@ if __name__ == "__main__":
         }
         logger.info("done loading")
         text, runtime = tqdm_generate(
-            inputs, task=task, return_timestamps=return_timestamps, progress=progress
+            inputs, task=task, return_timestamps=return_timestamps
         )
         return text, runtime
-
-    def _return_yt_html_embed(yt_url):
-        video_id = yt_url.split("?v=")[-1]
-        HTML_str = (
-            f'<center> <iframe width="500" height="320" src="https://www.youtube.com/embed/{video_id}"> </iframe>'
-            " </center>"
-        )
-        return HTML_str
-
-    def download_yt_audio(yt_url, filename):
-        info_loader = youtube_dl.YoutubeDL()
-        try:
-            info = info_loader.extract_info(yt_url, download=False)
-        except youtube_dl.utils.DownloadError as err:
-            raise gr.Error(str(err))
-
-        file_length = info["duration_string"]
-        file_h_m_s = file_length.split(":")
-        file_h_m_s = [int(sub_length) for sub_length in file_h_m_s]
-        if len(file_h_m_s) == 1:
-            file_h_m_s.insert(0, 0)
-        if len(file_h_m_s) == 2:
-            file_h_m_s.insert(0, 0)
-
-        file_length_s = file_h_m_s[0] * 3600 + file_h_m_s[1] * 60 + file_h_m_s[2]
-        if file_length_s > YT_LENGTH_LIMIT_S:
-            yt_length_limit_hms = time.strftime(
-                "%HH:%MM:%SS", time.gmtime(YT_LENGTH_LIMIT_S)
-            )
-            file_length_hms = time.strftime("%HH:%MM:%SS", time.gmtime(file_length_s))
-            raise gr.Error(
-                f"Maximum YouTube length is {yt_length_limit_hms}, got {file_length_hms} YouTube video."
-            )
-
-        ydl_opts = {
-            "outtmpl": filename,
-            "format": "worstvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        }
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            try:
-                ydl.download([yt_url])
-            except youtube_dl.utils.ExtractorError as err:
-                raise gr.Error(str(err))
-
-    def transcribe_youtube(yt_url, task, return_timestamps, progress=gr.Progress()):
-        progress(0, desc="Loading audio file...")
-        logger.info("loading youtube file...")
-        html_embed_str = _return_yt_html_embed(yt_url)
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            filepath = os.path.join(tmpdirname, "video.mp4")
-            download_yt_audio(yt_url, filepath)
-
-            with open(filepath, "rb") as f:
-                inputs = f.read()
-
-        inputs = ffmpeg_read(inputs, pipeline.feature_extractor.sampling_rate)
-        inputs = {
-            "array": inputs,
-            "sampling_rate": pipeline.feature_extractor.sampling_rate,
-        }
-        logger.info("done loading...")
-        text, runtime = tqdm_generate(
-            inputs, task=task, return_timestamps=return_timestamps, progress=progress
-        )
-        return html_embed_str, text, runtime
-
-    microphone_chunked = gr.Interface(
-        fn=transcribe_chunked_audio,
-        inputs=[
-            gr.inputs.Audio(source="microphone", optional=True, type="filepath"),
-            gr.inputs.Radio(
-                ["transcribe", "translate"], label="Task", default="transcribe"
-            ),
-            gr.inputs.Checkbox(default=False, label="Return timestamps"),
-        ],
-        outputs=[
-            gr.outputs.Textbox(label="Transcription").style(show_copy_button=True),
-            gr.outputs.Textbox(label="Transcription Time (s)"),
-        ],
-        allow_flagging="never",
-        title=title,
-        description=description,
-        article=article,
-    )
-
-    audio_chunked = gr.Interface(
-        fn=transcribe_chunked_audio,
-        inputs=[
-            gr.inputs.Audio(
-                source="upload", optional=True, label="Audio file", type="filepath"
-            ),
-            gr.inputs.Radio(
-                ["transcribe", "translate"], label="Task", default="transcribe"
-            ),
-            gr.inputs.Checkbox(default=False, label="Return timestamps"),
-        ],
-        outputs=[
-            gr.outputs.Textbox(label="Transcription").style(show_copy_button=True),
-            gr.outputs.Textbox(label="Transcription Time (s)"),
-        ],
-        allow_flagging="never",
-        title=title,
-        description=description,
-        article=article,
-    )
-
-    youtube = gr.Interface(
-        fn=transcribe_youtube,
-        inputs=[
-            gr.inputs.Textbox(
-                lines=1,
-                placeholder="Paste the URL to a YouTube video here",
-                label="YouTube URL",
-            ),
-            gr.inputs.Radio(
-                ["transcribe", "translate"], label="Task", default="transcribe"
-            ),
-            gr.inputs.Checkbox(default=False, label="Return timestamps"),
-        ],
-        outputs=[
-            gr.outputs.HTML(label="Video"),
-            gr.outputs.Textbox(label="Transcription").style(show_copy_button=True),
-            gr.outputs.Textbox(label="Transcription Time (s)"),
-        ],
-        allow_flagging="never",
-        title=title,
-        examples=[["https://www.youtube.com/watch?v=m8u-18Q0s7I", "transcribe", False]],
-        cache_examples=False,
-        description=description,
-        article=article,
-    )
-
-    demo = gr.Blocks()
-
-    with demo:
-        gr.TabbedInterface(
-            [microphone_chunked, audio_chunked, youtube],
-            ["Microphone", "Audio File", "YouTube"],
-        )
-
-    demo.queue(concurrency_count=1, max_size=5)
-    demo.launch(server_name="0.0.0.0", show_api=False)
