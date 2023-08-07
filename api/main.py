@@ -32,7 +32,13 @@ api_image = (
             "RUN ln -s /usr/bin/python3 /usr/bin/python",
         ],
     )
-    .pip_install("jax[cuda12_local]", "https://github.com/sanchit-gandhi/whisper-jax/archive/main.tar.gz", "requests")
+    .pip_install(
+        "ffmpeg-python",
+        "jax[cuda12_local]",
+        "https://github.com/sanchit-gandhi/whisper-jax/archive/main.tar.gz",
+        "requests",
+    )
+    .apt_install("ffmpeg")
     .run_commands(
         "echo hi i am modal",
         "nvcc --version",
@@ -90,20 +96,37 @@ def format_timestamp(seconds: float, always_include_hours: bool = False, decimal
         return seconds
 
 
-@stub.function(cpu=4, gpu=gpu.A100(memory=20))
+@stub.function(cpu=4, gpu=gpu.A100(memory=20), timeout=900)
 @web_endpoint()
 def run_me():
     print("I also update on file edit!")
-    with Whisper() as whisper:
-        result, runtime = whisper.transcribe(
-            "https://qualitativecloud.slack.com/files/U03MHNU00BZ/F05AQPAKY93/1_navy_federal_credit_union_us-billsimmons__midroll_.mp3",
-            "transcribe",
-            "false",
-        )
-        print(result, runtime)
+    whisper = WhisperSingleton.getInstance()
+    result, runtime = whisper.transcribe(
+        "https://filebin.net/uxupfi7d18384rdw/1_Navy_Federal_Credit_Union_US-BillSimmons__Midroll___1_.mp3",
+        "transcribe",
+        "false",
+    )
+    print(result, runtime)
 
 
-@stub.cls(cpu=4, gpu=gpu.T4(count=1))
+class WhisperSingleton:
+    _instance = None
+
+    @staticmethod
+    def getInstance():
+        if WhisperSingleton._instance is None:
+            WhisperSingleton._instance = Whisper()
+            WhisperSingleton._instance.__enter__()
+        return WhisperSingleton._instance
+
+    @staticmethod
+    def cleanup():
+        if WhisperSingleton._instance is not None:
+            WhisperSingleton._instance.__exit__(None, None, None)
+            WhisperSingleton._instance = None
+
+
+@stub.cls(cpu=4, gpu=gpu.A100(memory=20), timeout=900, shared_volumes={"/jax_cache": volume})
 class Whisper:
     # Code below executes on container start
     # https://modal.com/docs/guide/lifecycle-functions#__enter__-and-__aenter__
